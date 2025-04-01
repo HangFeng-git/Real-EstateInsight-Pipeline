@@ -1,0 +1,180 @@
+"""
+RealEstateInsight Pipeline
+Automated ETL system for condo market analysis
+Sources: MLS APIs, review sites, and market data feeds
+Outputs: Cleaned listings, sentiment analysis, and opportunity reports
+"""
+
+# Import libraries
+import pandas as pd
+import requests
+from bs4 import BeautifulSoup
+from sqlalchemy import create_engine
+from datetime import datetime
+import logging
+
+# 1. Configuration Setup
+CONFIG = {
+    'database': {
+        'url': 'postgresql://user:password@localhost:5432/real_estate',
+        'tables': ['condo_listings', 'property_reviews', 'market_trends']
+    },
+    'sources': {
+        'mls_api': 'https://api.mls.com/listings',
+        'review_site': 'https://realestateplatform.com/reviews/nyc',
+        'market_data': 'https://data.cityofnewyork.us/api/real_estate'
+    }
+}
+
+# 2. Data Extraction Module
+def extract_data():
+    """Fetches raw data from all configured sources"""
+    
+    # MLS Listings API
+    listings = pd.DataFrame()
+    try:
+        response = requests.get(
+            CONFIG['sources']['mls_api'],
+            params={'location': 'New York', 'type': 'condo'}
+        )
+        listings = pd.json_normalize(response.json()['listings'])
+        logging.info(f"Fetched {len(listings)} MLS listings")
+    except Exception as e:
+        logging.error(f"MLS extraction failed: {str(e)}")
+    
+    # Review Site Scraping
+    reviews = pd.DataFrame()
+    try:
+        html = requests.get(CONFIG['sources']['review_site']).text
+        soup = BeautifulSoup(html, 'html.parser')
+        review_data = [{
+            'property_id': div.get('data-id'),
+            'rating': float(div.select_one('.stars').text),
+            'comment': div.select_one('.review-text').text.strip(),
+            'date': datetime.strptime(div.select_one('.date').text, '%m/%d/%Y')
+        } for div in soup.select('.review')]
+        reviews = pd.DataFrame(review_data)
+        logging.info(f"Scraped {len(reviews)} reviews")
+    except Exception as e:
+        logging.error(f"Review scraping failed: {str(e)}")
+    
+    # Market Data API
+    market = pd.DataFrame()
+    try:
+        response = requests.get(CONFIG['sources']['market_data'])
+        market = pd.DataFrame(response.json()['trends'])
+        logging.info(f"Retrieved market trends for {len(market)} periods")
+    except Exception as e:
+        logging.error(f"Market data fetch failed: {str(e)}")
+    
+    return {'listings': listings, 'reviews': reviews, 'market': market}
+
+# 3. Data Transformation Module
+def transform_data(raw_data):
+    """Cleans and enriches raw datasets"""
+    
+    # Listings Cleaning
+    listings = raw_data['listings'].copy()
+    if not listings.empty:
+        # Standardize columns
+        listings = listings.rename(columns={
+            'listPrice': 'price',
+            'sqFt': 'sqft',
+            'property.subdivision': 'neighborhood'
+        })
+        
+        # Calculate metrics
+        listings['price_per_sqft'] = listings['price'] / listings['sqft']
+        listings['last_updated'] = datetime.now()
+        
+        # Filter columns
+        listings = listings[[
+            'listingId', 'address.full', 'neighborhood', 
+            'price', 'sqft', 'bedrooms', 'bathrooms',
+            'price_per_sqft', 'last_updated'
+        ]]
+    
+    # Reviews Processing
+    reviews = raw_data['reviews'].copy()
+    if not reviews.empty:
+        # Sentiment analysis
+        reviews['sentiment'] = reviews['rating'].apply(
+            lambda x: 'positive' if x >= 4 else 'neutral' if x >= 2 else 'negative')
+        
+        # Date formatting
+        reviews['date'] = pd.to_datetime(reviews['date'])
+    
+    # Market Data Processing
+    market = raw_data['market'].copy()
+    if not market.empty:
+        # Convert string percentages
+        market['price_change'] = market['price_change'].str.rstrip('%').astype(float) / 100
+        market['inventory_change'] = market['inventory_change'].str.rstrip('%').astype(float) / 100
+        
+        # Ensure chronological order
+        market = market.sort_values('period').ffill()
+    
+    return {
+        'clean_listings': listings,
+        'clean_reviews': reviews, 
+        'clean_market': market
+    }
+
+# 4. Data Loading Module
+def load_data(clean_data):
+    """Stores processed data in database"""
+    
+    engine = create_engine(CONFIG['database']['url'])
+    
+    try:
+        # Load each dataset
+        clean_data['clean_listings'].to_sql(
+            name=CONFIG['database']['tables'][0],
+            con=engine,
+            if_exists='replace',
+            index=False
+        )
+        
+        clean_data['clean_reviews'].to_sql(
+            name=CONFIG['database']['tables'][1],
+            con=engine,
+            if_exists='append',  # Preserve historical reviews
+            index=False
+        )
+        
+        clean_data['clean_market'].to_sql(
+            name=CONFIG['database']['tables'][2],
+            con=engine,
+            if_exists='replace',
+            index=False
+        )
+        
+        logging.info("Data successfully loaded to database")
+        return True
+    except Exception as e:
+        logging.error(f"Database load failed: {str(e)}")
+        return False
+
+# 5. Main Execution Flow
+if __name__ == "__main__":
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        filename='pipeline.log'
+    )
+    
+    logging.info("Starting RealEstateInsight Pipeline")
+    
+    try:
+        # ETL Process
+        raw_data = extract_data()
+        clean_data = transform_data(raw_data)
+        load_success = load_data(clean_data)
+        
+        if load_success:
+            logging.info("Pipeline completed successfully")
+        else:
+            logging.warning("Pipeline completed with errors")
+    except Exception as e:
+        logging.critical(f"Pipeline failed: {str(e)}", exc_info=True)
